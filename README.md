@@ -6,7 +6,7 @@ Analysis and figure scripts accompanying the paper:
 >
 > Bart Hoekstra, Emiel van Loon, Judy Shamoun-Baranes
 
-This repository contains the code to reproduce all analyses and figures presented in the paper. The core modeling framework is implemented in the [murmuR](https://github.com/barthoekstra/murmuR) R package, which this repository depends on.
+This repository contains the code to reproduce all analyses and figures presented in the paper. Most scripts depend on the [murmuR](https://github.com/barthoekstra/murmuR) R package (v1.0.0) for data paths, constants, and model infrastructure.
 
 ## Setup
 
