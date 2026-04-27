@@ -1,4 +1,5 @@
 # murmuR-paper
+[![DOI](https://zenodo.org/badge/1194467651.svg)](https://doi.org/10.5281/zenodo.19823028)
 
 Analysis and figure scripts accompanying the paper:
 
