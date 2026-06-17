@@ -220,17 +220,17 @@ cx0 <- findInterval(px_lon, wt_lon, all.inside = TRUE)
 cy0 <- findInterval(px_lat, wt_lat, all.inside = TRUE)     # px_lat is N->S
 fcx <- (px_lon - wt_lon[cx0]) / (wt_lon[cx0 + 1] - wt_lon[cx0])
 fcy <- (px_lat - wt_lat[cy0]) / (wt_lat[cy0 + 1] - wt_lat[cy0])
+n_pxlon <- length(px_lon); n_pxlat <- length(px_lat)
+fcy_row <- matrix(1 - fcy, nrow = n_pxlon, ncol = n_pxlat, byrow = TRUE)
+fcy_rowc<- matrix(fcy,     nrow = n_pxlon, ncol = n_pxlat, byrow = TRUE)
 daylight_weight <- function(dt) {
   p <- getSunlightPosition(data = data.frame(date = dt, lat = wt_g$lat, lon = wt_g$lon))
   W <- matrix(pmin(1, pmax(0, (p$altitude * 180 / pi + 6) / 12)),
               nrow = length(wt_lon), ncol = length(wt_lat))   # W[lon, lat]
-  out <- matrix(0, nrow = length(px_lat), ncol = length(px_lon))
-  for (c in seq_along(px_lon)) {
-    top <- W[cx0[c], cy0] * (1 - fcx[c]) + W[cx0[c] + 1, cy0] * fcx[c]
-    bot <- W[cx0[c], cy0 + 1] * (1 - fcx[c]) + W[cx0[c] + 1, cy0 + 1] * fcx[c]
-    out[, c] <- top * (1 - fcy) + bot * fcy
-  }
-  out                                                  # [px_lat (N->S), px_lon]
+  # separable bilinear: interpolate along lon (rows), then along lat (cols)
+  Wc <- W[cx0, , drop = FALSE] * (1 - fcx) + W[cx0 + 1, , drop = FALSE] * fcx  # [px_lon, wt_lat]
+  out_t <- Wc[, cy0, drop = FALSE] * fcy_row + Wc[, cy0 + 1, drop = FALSE] * fcy_rowc
+  t(out_t)                                              # [px_lat (N->S), px_lon]
 }
 blend_basemap <- function(dt) {
   wa <- array(daylight_weight(dt), dim = c(img_dim[1], img_dim[2], 3))
@@ -256,6 +256,7 @@ wind_grid <- function(tidx) {
   key <- as.character(tidx)
   if (!is.null(.wcache[[key]])) return(.wcache[[key]])
   ti <- which(abs(as.numeric(nc_times) - as.numeric(dts[tidx])) < 1800)[1]
+  if (is.na(ti)) ti <- which.min(abs(as.numeric(nc_times) - as.numeric(dts[tidx])))  # clamp to nearest
   u <- ncvar_get(nc, "u", start = c(1, 1, lev_idx, ti), count = c(-1, -1, 1, 1))
   v <- ncvar_get(nc, "v", start = c(1, 1, lev_idx, ti), count = c(-1, -1, 1, 1))
   d <- copy(wgrid); d[, u := u[cbind(i, j)]][, v := v[cbind(i, j)]]
@@ -474,17 +475,24 @@ render_design <- function() {
 
 render_full <- function() {
   all_t <- seq.POSIXt(win_start, win_end, by = sprintf("%d min", FRAME_STEP_MIN))
-  cat(sprintf("Full render: %d frames\n", length(all_t)))
+  # Pre-read every hourly wind grid into .wcache BEFORE forking so the parallel
+  # workers never touch the (non-fork-safe) netCDF handle.
+  for (tt in tidx_of(win_start):tidx_of(win_end)) wind_grid(tt)
   fdir <- "figures/anim_frames/full"; unlink(fdir, recursive = TRUE); dir.create(fdir, recursive = TRUE)
+  ncores <- max(1L, min(12L, parallel::detectCores() - 2L))
+  cat(sprintf("Full render: %d frames on %d cores\n", length(all_t), ncores))
   t0 <- Sys.time()
-  for (k in seq_along(all_t)) {
+  res <- parallel::mclapply(seq_along(all_t), function(k) {
     f <- sprintf("%s/frame_%05d.png", fdir, k)
     agg_png(f, width = W_IN, height = H_IN, units = "in", res = DPI)
     print(make_frame(all_t[k])); dev.off()
-    if (k %% 60L == 0L || k == length(all_t))
-      cat(sprintf("  %d/%d (%.0fs)\n", k, length(all_t),
-                  as.numeric(difftime(Sys.time(), t0, units = "secs"))))
-  }
+    file.exists(f)
+  }, mc.cores = ncores, mc.preschedule = TRUE)
+  ok <- sum(vapply(res, isTRUE, logical(1)))
+  cat(sprintf("rendered %d/%d frames in %.0fs (%.2fs/frame)\n", ok, length(all_t),
+              as.numeric(difftime(Sys.time(), t0, units = "secs")),
+              as.numeric(difftime(Sys.time(), t0, units = "secs")) / length(all_t)))
+  if (ok < length(all_t)) stop("Some frames failed to render; not encoding.")
   status <- system2(ffmpeg_bin, c("-y", "-framerate", FPS, "-i",
     file.path(fdir, "frame_%05d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p",
     "-movflags", "+faststart", out_mp4))
