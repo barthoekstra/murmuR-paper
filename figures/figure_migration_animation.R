@@ -129,6 +129,13 @@ set.seed(subsample_seed)
 keep_birds <- sample(C$movers, ceiling(length(C$movers) * SUBSAMPLE_FRAC))
 sub <- sub[bird %in% keep_birds]; setkey(sub, tidx, bird)
 
+# Per-bird sub-hour phase offset in [0,1): desynchronises the hourly quantisation
+# so departures (and the aloft count) spread smoothly across each hour instead
+# of all snapping to :00. Each bird's whole timeline is shifted by its phase.
+set.seed(subsample_seed + 1L)
+bird_phase <- data.table(bird = keep_birds, phi = runif(length(keep_birds)))
+setkey(bird_phase, bird)
+
 # ---------------------------------------------------------------------------
 # NL crossing + source origins (precompute once)
 # ---------------------------------------------------------------------------
@@ -268,31 +275,47 @@ wind_interp <- function(dt) {
 # Bird state at an arbitrary (interpolated) time
 # ---------------------------------------------------------------------------
 frame_birds <- function(dt) {
-  t0 <- tidx_of(as.POSIXct(trunc(dt, "hours"), tz = "UTC"))
-  f  <- as.numeric(difftime(dt, dts[t0], units = "hours"))
-  a  <- sub[tidx == t0, .(bird, x, y, state)]
-  b  <- sub[tidx == t0 + 1L, .(bird, xb = x, yb = y)]
-  m  <- merge(a, b, by = "bird", all.x = TRUE)
-  m[!is.na(xb), `:=`(x = x + f * (xb - x), y = y + f * (yb - y))]
-  m[, crossed := bird %in% nl_crossers & bird %in% cross_info[crossed_tidx <= t0, bird]]
-  fly <- m[state == 1L]; grd <- m[state == 0L]
+  # continuous tidx of this (sub-hourly) frame; tidx 1 == dts[1]
+  t_h <- 1 + as.numeric(difftime(dt, dts[1], units = "hours"))
+  # per-bird shifted time -> per-bird floor hour t0 and fraction f
+  B <- copy(bird_phase)
+  B[, tau := t_h - phi]
+  B[, t0 := as.integer(floor(tau))]
+  B[, f := tau - t0]
 
-  # Trails: hourly anchors over [t0-K, t0] + interpolated head per flyer.
-  flb <- fly$bird
-  Kb  <- if (SOURCE_MODE == "trails") trail_K_nl else trail_K
-  Kmax<- max(trail_K, Kb)
-  hist <- sub[bird %in% flb & tidx >= (t0 - Kmax) & tidx <= t0, .(bird, tidx, x, y)]
-  head <- fly[, .(bird, tidx = t0 + 1L, x, y)]          # interpolated head as t0+1 anchor
-  hist <- rbind(hist, head); setorder(hist, bird, tidx)
-  hist[, `:=`(x1 = data.table::shift(x, -1L), y1 = data.table::shift(y, -1L),
-              t1 = data.table::shift(tidx, -1L)), by = bird]
-  seg <- hist[!is.na(t1)]
-  seg[, age := pmax(0, t0 - tidx)]
-  seg[, crossed := bird %in% cross_info[crossed_tidx <= t0, bird]]
-  seg[, K := ifelse(crossed & SOURCE_MODE == "trails", trail_K_nl, trail_K)]
-  seg <- seg[age <= K]
-  seg[, w := pmax(0, (1 - age / (K + 1))) ^ trail_gamma]
-  list(fly = fly, grd = grd, seg = seg, t0 = t0)
+  # current-hour state/position (only birds active at their own t0 are present)
+  qcur <- B[, .(bird, tidx = t0, f, bt0 = t0)]
+  a <- sub[qcur, on = .(bird, tidx), nomatch = 0L,
+           .(bird, x, y, state, f = i.f, t0 = i.bt0)]
+  nxt <- sub[a[, .(bird, tidx = t0 + 1L)], on = .(bird, tidx), nomatch = NA,
+             .(bird, xb = x, yb = y)]
+  a <- merge(a, nxt, by = "bird", all.x = TRUE)
+  a[!is.na(xb), `:=`(x = x + f * (xb - x), y = y + f * (yb - y))]
+  fly <- a[state == 1L]
+
+  # Smooth trails: every vertex is the bird's position interpolated at the SAME
+  # fraction f, so the whole trail slides forward continuously (no hourly
+  # stutter) and stays continuous across hour boundaries.
+  K  <- trail_K
+  Fd <- fly[, .(bird, t0, f)]
+  vts <- vector("list", K + 1L)
+  for (j in 0:K) {
+    xl <- sub[Fd[, .(bird, tidx = t0 - j, f)], on = .(bird, tidx), nomatch = 0L,
+              .(bird, xl = x, yl = y, f = i.f)]
+    xh <- sub[Fd[, .(bird, tidx = t0 - j + 1L)], on = .(bird, tidx), nomatch = 0L,
+              .(bird, xh = x, yh = y)]
+    m <- merge(xl, xh, by = "bird")
+    m[, `:=`(vx = xl + f * (xh - xl), vy = yl + f * (yh - yl), j = j)]
+    vts[[j + 1L]] <- m[, .(bird, j, vx, vy)]
+  }
+  V <- rbindlist(vts); setorder(V, bird, j)
+  V[, `:=`(vx1 = data.table::shift(vx, -1L), vy1 = data.table::shift(vy, -1L),
+           j1 = data.table::shift(j, -1L)), by = bird]
+  seg <- V[!is.na(j1) & j1 == j + 1L]
+  seg[, age := j][, w := pmax(0, (1 - age / (K + 1))) ^ trail_gamma]
+
+  list(fly = fly, seg = seg, t0 = as.integer(floor(t_h)),
+       aloft = round(nrow(fly) / SUBSAMPLE_FRAC))   # scale subsample -> est. true aloft
 }
 
 # Source glow: origins of NL-birds that have departed by t0.
@@ -374,7 +397,7 @@ make_frame <- function(dt) {
     scale_colour_gradient(low = pal$arrow_low, high = pal$arrow_high,
       limits = ws_rng, oob = scales::squish, guide = "none") +
     # flight trails (short, quick fade)
-    geom_segment(data = fb$seg, aes(x, y, xend = x1, yend = y1, alpha = w),
+    geom_segment(data = fb$seg, aes(vx, vy, xend = vx1, yend = vy1, alpha = w),
       colour = pal$trail, linewidth = 0.24, lineend = "round") +
     scale_alpha_identity() +
     # flyers: halo + bright core (single warm colour)
@@ -397,7 +420,7 @@ make_frame <- function(dt) {
       label = "Simulated nocturnal bird migration · 850 hPa wind",
       hjust = 0, vjust = 1, colour = pal$text_dim, family = FONT, size = 3.3) +
     annotate("text", x = view[["xmin"]] + 0.55, y = view[["ymax"]] - 2.28,
-      label = format(nrow(fb$fly), big.mark = ","), hjust = 0, vjust = 1,
+      label = format(fb$aloft, big.mark = ","), hjust = 0, vjust = 1,
       colour = pal$fly_core, family = FONT, fontface = "bold", size = 8.4) +
     annotate("text", x = view[["xmin"]] + 0.62, y = view[["ymax"]] - 3.02,
       label = "migrants aloft", hjust = 0, vjust = 1,
