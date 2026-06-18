@@ -1,5 +1,5 @@
-# Animated map of two weeks of simulated autumn nocturnal bird migration
-# (final two weeks of October 2018) over the IBM data domain.
+# Animated map of simulated autumn nocturnal bird migration over the IBM data
+# domain (window set by win_start/win_end; default 15 Sep - 15 Nov 2018).
 #
 # Features
 #   * Realistic Earth basemap. With a MapTiler key (env MAPTILER_API_KEY) the
@@ -41,10 +41,10 @@ FONT <- "Open Sans"
 MODE          <- Sys.getenv("ANIM_MODE", "design")   # design | clip | full
 
 data_path     <- "/data/birdcloudstorage-tvm/ibm-ml-refactor/data/"
-wind_file     <- "/data/birdcloudstorage-tvm/ibm-ml/data/ecmwf-era5-pressurelevels/2018/201810.nc"
+wind_dir      <- "/data/birdcloudstorage-tvm/ibm-ml/data/ecmwf-era5-pressurelevels/2018"
 wind_level    <- 850L                       # hPa (== murmuR::ibm_pressurelevel)
 tracks_file   <- file.path(data_path, "processed/tracks/seasons/2018_autumn.RDS")
-cache_file    <- "figures/.cache_movers_oct2018.RDS"
+cache_file    <- "figures/.cache_movers_sep15_nov15.RDS"
 nl_cache      <- "figures/.cache_nl_polygon.RDS"
 esri_cache    <- "figures/.cache_basemap_esri.RDS"
 mt_cache      <- "figures/.cache_basemap_maptiler.RDS"
@@ -53,8 +53,8 @@ mt_cache      <- "figures/.cache_basemap_maptiler.RDS"
 view          <- c(xmin = -10, ymin = 48, xmax = 20, ymax = 58)
 radar_lon     <- 5.1381; radar_lat <- 51.8369
 
-win_start     <- as.POSIXct("2018-10-18 00:00", tz = "UTC")
-win_end       <- as.POSIXct("2018-10-31 23:00", tz = "UTC")
+win_start     <- as.POSIXct("2018-09-15 00:00", tz = "UTC")
+win_end       <- as.POSIXct("2018-11-15 23:00", tz = "UTC")
 FRAME_STEP_MIN<- 10L
 
 wind_stride   <- 5L
@@ -75,8 +75,8 @@ sat_zoom      <- 6L
 phen_cache    <- "figures/.cache_phenology_2018autumn.RDS"
 
 # Smooth preview clip (MODE = "clip"): a full dusk -> night -> dawn peak night.
-clip_from     <- "2018-10-18 14:00"
-clip_to       <- "2018-10-19 09:00"
+clip_from     <- "2018-10-31 22:00"
+clip_to       <- "2018-11-01 02:00"
 
 # NL polygon crop (European NL only)
 nl_bbox       <- st_bbox(c(xmin = 3, ymin = 50, xmax = 8, ymax = 54), crs = 4326)
@@ -238,16 +238,26 @@ blend_basemap <- function(dt) {
 }
 
 # ---------------------------------------------------------------------------
-# Winds: 850 hPa, decimated, memoised per hour, linearly interpolated
+# Winds: 850 hPa, decimated, memoised per hour, linearly interpolated.
+# The window can span several monthly ERA5 files, so open every month it
+# touches and build one datetime -> (file, time index) map.
 # ---------------------------------------------------------------------------
-nc      <- nc_open(wind_file)
-nc_lon  <- nc$dim[[grep("^lon", names(nc$dim), ignore.case = TRUE)[1]]]$vals
-nc_lat  <- nc$dim[[grep("^lat", names(nc$dim), ignore.case = TRUE)[1]]]$vals
-nc_tname<- grep("time", names(nc$dim), ignore.case = TRUE, value = TRUE)[1]
-nc_lev  <- nc$dim[[grep("level", names(nc$dim), ignore.case = TRUE)[1]]]$vals
+win_months <- sort(unique(format(seq(win_start, win_end, by = "day"), "%Y%m")))
+wind_files <- file.path(wind_dir, sprintf("%s.nc", win_months))
+ncs <- lapply(wind_files, nc_open)
+nc1 <- ncs[[1]]
+nc_lon  <- nc1$dim[[grep("^lon", names(nc1$dim), ignore.case = TRUE)[1]]]$vals
+nc_lat  <- nc1$dim[[grep("^lat", names(nc1$dim), ignore.case = TRUE)[1]]]$vals
+nc_lev  <- nc1$dim[[grep("level", names(nc1$dim), ignore.case = TRUE)[1]]]$vals
 lev_idx <- which(nc_lev == wind_level)
-nc_torigin <- as.POSIXct(sub(".*since *", "", nc$dim[[nc_tname]]$units), tz = "UTC")
-nc_times   <- nc_torigin + nc$dim[[nc_tname]]$vals * 3600
+time_map <- rbindlist(lapply(seq_along(ncs), function(fi) {
+  nc <- ncs[[fi]]
+  tn <- grep("time", names(nc$dim), ignore.case = TRUE, value = TRUE)[1]
+  torig <- as.POSIXct(sub(".*since *", "", nc$dim[[tn]]$units), tz = "UTC")
+  data.table(datetime = torig + nc$dim[[tn]]$vals * 3600, fi = fi,
+             ti = seq_along(nc$dim[[tn]]$vals))
+}))
+setkey(time_map, datetime)
 lon_keep <- seq(1, length(nc_lon), by = wind_stride)
 lat_keep <- seq(1, length(nc_lat), by = wind_stride)
 wgrid    <- CJ(j = lat_keep, i = lon_keep); wgrid[, `:=`(lon = nc_lon[i], lat = nc_lat[j])]
@@ -255,10 +265,10 @@ wgrid    <- CJ(j = lat_keep, i = lon_keep); wgrid[, `:=`(lon = nc_lon[i], lat = 
 wind_grid <- function(tidx) {
   key <- as.character(tidx)
   if (!is.null(.wcache[[key]])) return(.wcache[[key]])
-  ti <- which(abs(as.numeric(nc_times) - as.numeric(dts[tidx])) < 1800)[1]
-  if (is.na(ti)) ti <- which.min(abs(as.numeric(nc_times) - as.numeric(dts[tidx])))  # clamp to nearest
-  u <- ncvar_get(nc, "u", start = c(1, 1, lev_idx, ti), count = c(-1, -1, 1, 1))
-  v <- ncvar_get(nc, "v", start = c(1, 1, lev_idx, ti), count = c(-1, -1, 1, 1))
+  m <- time_map[.(dts[tidx])]
+  if (is.na(m$fi)) m <- time_map[which.min(abs(as.numeric(datetime) - as.numeric(dts[tidx])))]
+  u <- ncvar_get(ncs[[m$fi]], "u", start = c(1, 1, lev_idx, m$ti), count = c(-1, -1, 1, 1))
+  v <- ncvar_get(ncs[[m$fi]], "v", start = c(1, 1, lev_idx, m$ti), count = c(-1, -1, 1, 1))
   d <- copy(wgrid); d[, u := u[cbind(i, j)]][, v := v[cbind(i, j)]]
   .wcache[[key]] <- d; d
 }
@@ -452,9 +462,9 @@ DPI <- 150
 W_PX <- 1920L
 H_PX <- 2L * round(W_PX / geo_aspc / 2)        # force EVEN height (libx264/yuv420p)
 W_IN <- W_PX / DPI; H_IN <- H_PX / DPI
-FPS  <- 12L
+FPS  <- 30L                                  # playback frame rate
 ffmpeg_bin <- path.expand("~/bin/ffmpeg")
-out_mp4    <- "figures/migration_oct2018.mp4"
+out_mp4    <- "figures/migration_sep15_nov15_2018.mp4"
 cat(sprintf("Basemap: %s | view aspect %.3f -> %.0fx%.0f px | wind range [%.1f,%.1f]\n",
             ifelse(USE_MAPTILER, "MapTiler blend", "Esri+gradient"),
             geo_aspc, W_IN * DPI, H_IN * DPI, ws_rng[1], ws_rng[2]))
@@ -516,4 +526,4 @@ render_clip <- function(from, to, out = "figures/preview_clip.mp4", fps = 12L) {
 if (MODE == "design") render_design()
 if (MODE == "clip")   render_clip(clip_from, clip_to)
 if (MODE == "full")   render_full()
-nc_close(nc)
+invisible(lapply(ncs, nc_close))
